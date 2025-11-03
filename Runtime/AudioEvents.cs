@@ -50,15 +50,5 @@ namespace Silent.Audio
         public static readonly Subject<SFXPlayRequest> OnSFXPlay = new();
         public static readonly Subject<LoopingSFXStartRequest> OnLoopingSFXStart = new();
         public static readonly Subject<LoopingSFXStopRequest> OnLoopingSFXStop = new();
-
-        /// <summary>
-        /// Stops a stateful looping sound associated with the given owner.
-        /// </summary>
-        public static void StopLoop(object owner)
-        {
-            if (owner == null) return;
-            var request = new LoopingSFXStopRequest { Owner = owner };
-            AudioEvents.OnLoopingSFXStop.OnNext(request);
-        }
     }
 }

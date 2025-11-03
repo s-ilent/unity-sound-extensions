@@ -44,13 +44,24 @@ namespace Silent.Audio
 
         /// <summary>
         /// Starts a stateful looping sound, tied to a specific owner object.
-        /// The loop will continue until StopLoop is called with the same owner.
+        /// The loop will continue until StopLoop is called.
         /// </summary>
         public static void StartLoop(this AudioCue cue, object owner)
         {
             if (cue == null || owner == null) return;
             var request = new LoopingSFXStartRequest { CueUID = cue.UID, Owner = owner };
             AudioEvents.OnLoopingSFXStart.OnNext(request);
+        }
+
+        /// <summary>
+        /// Stops a stateful looping sound associated with the given owner.
+        /// </summary>
+        public static void StopLoop(this AudioCue cue, object owner)
+        {
+            if (cue == null || owner == null) return;
+            // The request only needs the owner to find the active loop.
+            var request = new LoopingSFXStopRequest { Owner = owner };
+            AudioEvents.OnLoopingSFXStop.OnNext(request);
         }
     }
 }
