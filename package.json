@@ -1,0 +1,6 @@
+{
+  "name": "com.s-ilent.sound-extensions",
+  "displayName": "Sound Extensions",
+  "version": "1.0.0",
+  "description": "Experiments with wrapping Unity's audio APIs. "
+}
