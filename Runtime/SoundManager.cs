@@ -37,6 +37,24 @@ namespace Silent.Audio
         {
             public PooledSource PooledSource;
             public int Priority;
+            public AudioCue Cue;
+            public float StartTime;
+        }
+
+        // Helper class for sounds that follow a Transform
+        private class FollowingSound
+        {
+            public PooledSource PooledSource;
+            public AudioCue Cue;
+            public Transform FollowTarget;
+        }
+
+        // Helper class for stateful looping sounds (started by owner, stopped by owner)
+        private class LoopingSound
+        {
+            public PooledSource PooledSource;
+            public AudioCue Cue;
+            public object Owner;
         }
 
         [Header("Configuration")]
@@ -50,6 +68,9 @@ namespace Silent.Audio
         private Queue<PooledSource> _uiSpacePool;
         private List<ActiveVoice> _activeVoices = new();
         private Dictionary<SerializableGuid, AudioCue> _cueLookup;
+        private Dictionary<SerializableGuid, float> _lastPlayTimes = new();
+        private List<FollowingSound> _followingSounds = new();
+        private List<LoopingSound> _loopingSounds = new();
 
         void Awake()
         {
@@ -93,7 +114,55 @@ namespace Silent.Audio
         void Start()
         {
             AudioEvents.OnSFXPlay.Subscribe(HandleSFXPlay).AddTo(this);
-            // TODO: Add subscriptions for looping sounds when that feature is implemented.
+            AudioEvents.OnFollowSFXPlay.Subscribe(HandleFollowSFXPlay).AddTo(this);
+            AudioEvents.OnLoopingSFXStart.Subscribe(HandleLoopingSFXStart).AddTo(this);
+            AudioEvents.OnLoopingSFXStop.Subscribe(HandleLoopingSFXStop).AddTo(this);
+
+            // Subscribe to pause events from TimeScaleManager
+            TimeScaleManager.Instance.OnPaused.Subscribe(_ => PauseAllSounds()).AddTo(this);
+            TimeScaleManager.Instance.OnUnpaused.Subscribe(_ => UnpauseAllSounds()).AddTo(this);
+        }
+
+        private void PauseAllSounds()
+        {
+            foreach (var voice in _activeVoices)
+                voice.PooledSource.Source.Pause();
+            foreach (var sound in _followingSounds)
+                sound.PooledSource.Source.Pause();
+            foreach (var sound in _loopingSounds)
+                sound.PooledSource.Source.Pause();
+        }
+
+        private void UnpauseAllSounds()
+        {
+            foreach (var voice in _activeVoices)
+                voice.PooledSource.Source.UnPause();
+            foreach (var sound in _followingSounds)
+                sound.PooledSource.Source.UnPause();
+            foreach (var sound in _loopingSounds)
+                sound.PooledSource.Source.UnPause();
+        }
+
+        void Update()
+        {
+            // Update positions of following sounds
+            for (int i = _followingSounds.Count - 1; i >= 0; i--)
+            {
+                var sound = _followingSounds[i];
+                if (sound.FollowTarget == null)
+                {
+                    // Target destroyed, stop and recycle
+                    sound.PooledSource.Source.Stop();
+                    sound.PooledSource.Source.gameObject.SetActive(false);
+                    var pool = sound.Cue.type == SFXType.WorldSpace ? _worldSpacePool : _uiSpacePool;
+                    pool.Enqueue(sound.PooledSource);
+                    _followingSounds.RemoveAt(i);
+                }
+                else
+                {
+                    sound.PooledSource.Source.transform.position = sound.FollowTarget.position;
+                }
+            }
         }
 
         private void HandleSFXPlay(SFXPlayRequest request)
@@ -101,7 +170,96 @@ namespace Silent.Audio
             if (_cueLookup.TryGetValue(request.CueUID, out AudioCue cue))
             {
                 if (cue.clips == null || cue.clips.Length == 0) return;
+
+                // Frame capping: check retrigger cooldown
+                if (cue.retriggerCooldown > 0)
+                {
+                    if (_lastPlayTimes.TryGetValue(request.CueUID, out float lastTime))
+                    {
+                        if (Time.unscaledTime - lastTime < cue.retriggerCooldown) return;
+                    }
+                }
+
+                // Polyphony limiting: count voices for this cue
+                if (cue.maxPolyphony > 0)
+                {
+                    int currentCount = 0;
+                    ActiveVoice oldestVoice = null;
+                    float oldestTime = float.MaxValue;
+
+                    foreach (var v in _activeVoices)
+                    {
+                        if (v.Cue == cue && v.PooledSource.Source.isPlaying)
+                        {
+                            currentCount++;
+                            if (v.StartTime < oldestTime)
+                            {
+                                oldestTime = v.StartTime;
+                                oldestVoice = v;
+                            }
+                        }
+                    }
+
+                    if (currentCount >= cue.maxPolyphony)
+                    {
+                        // Oldest stealing: kill oldest voice for this cue to make room
+                        if (oldestVoice != null)
+                        {
+                            oldestVoice.PooledSource.Source.Stop();
+                            _activeVoices.Remove(oldestVoice);
+
+                            // Return stolen source to the pool immediately so PlaySoundAsync can reuse it
+                            var pool = cue.type == SFXType.WorldSpace ? _worldSpacePool : _uiSpacePool;
+                            pool.Enqueue(oldestVoice.PooledSource);
+                        }
+                    }
+                }
+
+                _lastPlayTimes[request.CueUID] = Time.unscaledTime;
                 PlaySoundAsync(cue, request).Forget();
+            }
+        }
+
+        private void HandleFollowSFXPlay(FollowSFXRequest request)
+        {
+            if (_cueLookup.TryGetValue(request.CueUID, out AudioCue cue))
+            {
+                if (cue.clips == null || cue.clips.Length == 0) return;
+                if (request.FollowTarget == null) return;
+                PlayFollowSoundAsync(cue, request).Forget();
+            }
+        }
+
+        private void HandleLoopingSFXStart(LoopingSFXStartRequest request)
+        {
+            if (_cueLookup.TryGetValue(request.CueUID, out AudioCue cue))
+            {
+                if (cue.clips == null || cue.clips.Length == 0) return;
+                // Stop any existing loop for this owner
+                StopLoopingSound(request.Owner);
+                PlayLoopingSoundAsync(cue, request.Owner).Forget();
+            }
+        }
+
+        private void HandleLoopingSFXStop(LoopingSFXStopRequest request)
+        {
+            StopLoopingSound(request.Owner);
+        }
+
+        private void StopLoopingSound(object owner)
+        {
+            for (int i = _loopingSounds.Count - 1; i >= 0; i--)
+            {
+                if (_loopingSounds[i].Owner == owner)
+                {
+                    var sound = _loopingSounds[i];
+                    sound.PooledSource.Source.Stop();
+                    sound.PooledSource.Source.gameObject.SetActive(false);
+                    var pool = sound.Cue.type == SFXType.WorldSpace ? _worldSpacePool : _uiSpacePool;
+                    pool.Enqueue(sound.PooledSource);
+                    _loopingSounds.RemoveAt(i);
+                    break;
+                }
             }
         }
 
@@ -190,8 +348,10 @@ namespace Silent.Audio
             }
 
             // --- Final Assignment to Components ---
+            // Use SlowMotionScale so HitStop doesn't affect pitch, but BulletTime does
+            float timeScalePitchMultiplier = Mathf.Max(0.01f, TimeScaleManager.Instance.SlowMotionScale);
             source.volume = finalVolume;
-            source.pitch = finalPitch;
+            source.pitch = finalPitch * timeScalePitchMultiplier;
 
             lowPass.enabled = cue.useLowPassFilter;
             lowPass.cutoffFrequency = finalLowPass;
@@ -215,7 +375,7 @@ namespace Silent.Audio
             source.loop = cue.isLooping;
             source.Play();
 
-            var activeVoice = new ActiveVoice { PooledSource = pooledSource, Priority = cue.category?.priority ?? 128 };
+            var activeVoice = new ActiveVoice { PooledSource = pooledSource, Priority = cue.category?.priority ?? 128, Cue = cue, StartTime = Time.unscaledTime };
             _activeVoices.Add(activeVoice);
 
             float duration = (cue.isLooping && cue.loopDuration > 0)
@@ -240,6 +400,177 @@ namespace Silent.Audio
                 var pool = cue.type == SFXType.WorldSpace ? _worldSpacePool : _uiSpacePool;
                 pool.Enqueue(pooledSource);
                 _activeVoices.Remove(activeVoice);
+            }
+        }
+
+        private async UniTaskVoid PlayFollowSoundAsync(AudioCue cue, FollowSFXRequest request)
+        {
+            PooledSource pooledSource = TryGetAvailableSource(cue);
+            if (pooledSource == null) return;
+
+            AudioSource source = pooledSource.Source;
+#if STEAMAUDIO_ENABLED
+            SteamAudio.SteamAudioSource steamAudioSource = pooledSource.SteamAudioSource;
+#endif
+            AudioLowPassFilter lowPass = pooledSource.LowPassFilter;
+            AudioHighPassFilter highPass = pooledSource.HighPassFilter;
+
+            source.gameObject.SetActive(true);
+
+            if (cue.type == SFXType.WorldSpace) source.transform.position = request.FollowTarget.position;
+            if (cue.category != null) source.outputAudioMixerGroup = cue.category.mixerGroup;
+            source.clip = cue.clips[Random.Range(0, cue.clips.Length)];
+
+            float finalVolume = cue.volume;
+            float finalPitch = cue.pitch + Random.Range(-cue.pitchVariation, cue.pitchVariation);
+            float finalLowPass = cue.lowPassCutoff;
+            float finalHighPass = cue.highPassCutoff;
+#if STEAMAUDIO_ENABLED
+            float finalDipoleWeight = cue.dipoleWeight;
+            float finalDipolePower = cue.dipolePower;
+            float finalOcclusionRadius = cue.occlusionRadius;
+#endif
+
+            if (request.AisacValues != null)
+            {
+                foreach (var mod in cue.modulators)
+                {
+                    if (request.AisacValues.TryGetValue(mod.control, out float value))
+                    {
+                        float mappedValue = mod.curve.Evaluate(value);
+                        switch (mod.target)
+                        {
+                            case AisacTargetParameter.Volume: finalVolume *= mappedValue; break;
+                            case AisacTargetParameter.Pitch: finalPitch *= mappedValue; break;
+                            case AisacTargetParameter.LowPassCutoff: finalLowPass = mappedValue; break;
+                            case AisacTargetParameter.HighPassCutoff: finalHighPass = mappedValue; break;
+#if STEAMAUDIO_ENABLED
+                            case AisacTargetParameter.Steam_DipoleWeight: finalDipoleWeight = mappedValue; break;
+                            case AisacTargetParameter.Steam_DipolePower: finalDipolePower = mappedValue; break;
+                            case AisacTargetParameter.Steam_OcclusionRadius: finalOcclusionRadius = mappedValue; break;
+#endif
+                        }
+                    }
+                }
+            }
+
+            float timeScalePitchMultiplier = Mathf.Max(0.01f, TimeScaleManager.Instance.SlowMotionScale);
+            source.volume = finalVolume;
+            source.pitch = finalPitch * timeScalePitchMultiplier;
+
+            lowPass.enabled = cue.useLowPassFilter;
+            lowPass.cutoffFrequency = finalLowPass;
+            highPass.enabled = cue.useHighPassFilter;
+            highPass.cutoffFrequency = finalHighPass;
+
+#if STEAMAUDIO_ENABLED
+            steamAudioSource.airAbsorption = cue.useAirAbsorption;
+            steamAudioSource.directivity = cue.useDirectivity;
+            steamAudioSource.dipoleWeight = finalDipoleWeight;
+            steamAudioSource.dipolePower = finalDipolePower;
+            steamAudioSource.occlusion = cue.useOcclusion;
+            steamAudioSource.occlusionType = cue.occlusionType;
+            steamAudioSource.occlusionRadius = finalOcclusionRadius;
+            steamAudioSource.occlusionSamples = cue.occlusionSamples;
+            steamAudioSource.transmission = cue.useTransmission;
+            steamAudioSource.transmissionType = cue.transmissionType;
+#endif
+
+            source.loop = cue.isLooping;
+            source.Play();
+
+            var followingSound = new FollowingSound { PooledSource = pooledSource, Cue = cue, FollowTarget = request.FollowTarget };
+            _followingSounds.Add(followingSound);
+
+            float duration = (cue.isLooping && cue.loopDuration > 0)
+                ? cue.loopDuration
+                : source.clip.length;
+
+            await UniTask.Delay(
+                System.TimeSpan.FromSeconds(duration / source.pitch),
+                ignoreTimeScale: true,
+                cancellationToken: source.GetCancellationTokenOnDestroy()
+            );
+
+            if (source.isPlaying && source.loop)
+            {
+                source.Stop();
+            }
+
+            if (_followingSounds.Contains(followingSound))
+            {
+                source.gameObject.SetActive(false);
+                var pool = cue.type == SFXType.WorldSpace ? _worldSpacePool : _uiSpacePool;
+                pool.Enqueue(pooledSource);
+                _followingSounds.Remove(followingSound);
+            }
+        }
+
+        private async UniTaskVoid PlayLoopingSoundAsync(AudioCue cue, object owner)
+        {
+            PooledSource pooledSource = TryGetAvailableSource(cue);
+            if (pooledSource == null) return;
+
+            AudioSource source = pooledSource.Source;
+#if STEAMAUDIO_ENABLED
+            SteamAudio.SteamAudioSource steamAudioSource = pooledSource.SteamAudioSource;
+#endif
+            AudioLowPassFilter lowPass = pooledSource.LowPassFilter;
+            AudioHighPassFilter highPass = pooledSource.HighPassFilter;
+
+            source.gameObject.SetActive(true);
+            source.transform.position = UnityEngine.Vector3.zero;
+            if (cue.category != null) source.outputAudioMixerGroup = cue.category.mixerGroup;
+            source.clip = cue.clips[Random.Range(0, cue.clips.Length)];
+
+            float finalVolume = cue.volume;
+            float finalPitch = cue.pitch;
+            float finalLowPass = cue.lowPassCutoff;
+            float finalHighPass = cue.highPassCutoff;
+#if STEAMAUDIO_ENABLED
+            float finalDipoleWeight = cue.dipoleWeight;
+            float finalDipolePower = cue.dipolePower;
+            float finalOcclusionRadius = cue.occlusionRadius;
+#endif
+
+            float timeScalePitchMultiplier = Mathf.Max(0.01f, TimeScaleManager.Instance.SlowMotionScale);
+            source.volume = finalVolume;
+            source.pitch = finalPitch * timeScalePitchMultiplier;
+
+            lowPass.enabled = cue.useLowPassFilter;
+            lowPass.cutoffFrequency = finalLowPass;
+            highPass.enabled = cue.useHighPassFilter;
+            highPass.cutoffFrequency = finalHighPass;
+
+#if STEAMAUDIO_ENABLED
+            steamAudioSource.airAbsorption = cue.useAirAbsorption;
+            steamAudioSource.directivity = cue.useDirectivity;
+            steamAudioSource.dipoleWeight = finalDipoleWeight;
+            steamAudioSource.dipolePower = finalDipolePower;
+            steamAudioSource.occlusion = cue.useOcclusion;
+            steamAudioSource.occlusionType = cue.occlusionType;
+            steamAudioSource.occlusionRadius = finalOcclusionRadius;
+            steamAudioSource.occlusionSamples = cue.occlusionSamples;
+            steamAudioSource.transmission = cue.useTransmission;
+            steamAudioSource.transmissionType = cue.transmissionType;
+#endif
+
+            source.loop = true;
+            source.Play();
+
+            var loopingSound = new LoopingSound { PooledSource = pooledSource, Cue = cue, Owner = owner };
+            _loopingSounds.Add(loopingSound);
+
+            // For stateful looping sounds, we wait indefinitely until stopped
+            await UniTask.WaitUntilCanceled(cancellationToken: source.GetCancellationTokenOnDestroy());
+
+            // Only reached if cancelled (source destroyed)
+            if (_loopingSounds.Contains(loopingSound))
+            {
+                source.gameObject.SetActive(false);
+                var pool = cue.type == SFXType.WorldSpace ? _worldSpacePool : _uiSpacePool;
+                pool.Enqueue(pooledSource);
+                _loopingSounds.Remove(loopingSound);
             }
         }
     }

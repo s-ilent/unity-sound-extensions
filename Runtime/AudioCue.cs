@@ -26,6 +26,14 @@ namespace Silent.Audio
         [Tooltip("If > 0, the loop will automatically stop after this many seconds. If 0, it is a stateful loop that must be stopped manually.")]
         public float loopDuration = 0.0f;
 
+        [Header("Concurrency")]
+        [Tooltip("Maximum simultaneous instances of this sound. 0 = unlimited.")]
+        [Range(0, 10)]
+        public int maxPolyphony = 0;
+        [Tooltip("Minimum time between retriggering this sound (in seconds). 0 = unlimited.")]
+        [Range(0f, 1f)]
+        public float retriggerCooldown = 0f;
+
         [Header("Filters")]
         [Tooltip("If checked, the Low-Pass filter will be active.")]
         public bool useLowPassFilter;

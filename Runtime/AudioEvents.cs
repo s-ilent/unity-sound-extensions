@@ -45,10 +45,18 @@ namespace Silent.Audio
         public object Owner; // The object that previously started the loop
     }
 
+    public struct FollowSFXRequest
+    {
+        public SerializableGuid CueUID;
+        public Transform FollowTarget;
+        public Dictionary<AisacControl, float> AisacValues;
+    }
+
     public static class AudioEvents
     {
         public static readonly Subject<SFXPlayRequest> OnSFXPlay = new();
         public static readonly Subject<LoopingSFXStartRequest> OnLoopingSFXStart = new();
         public static readonly Subject<LoopingSFXStopRequest> OnLoopingSFXStop = new();
+        public static readonly Subject<FollowSFXRequest> OnFollowSFXPlay = new();
     }
 }
